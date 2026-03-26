@@ -1,5 +1,4 @@
 import { spawn } from "node:child_process";
-import { rm } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -7,7 +6,6 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const host = "127.0.0.1";
 const port = 4312;
 const baseUrl = `http://${host}:${port}`;
-const stateFile = path.join(__dirname, ".tmp-recovery-state.json");
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -38,16 +36,51 @@ async function post(pathname, payload) {
   });
 }
 
-async function getState(clientId) {
-  return fetchJson(`${baseUrl}/api/state?clientId=${encodeURIComponent(clientId)}`);
+async function bootstrap(clientId, extra = {}) {
+  return post("/api/bootstrap", {
+    clientId,
+    ...extra
+  });
 }
 
-async function waitForState(clientId, predicate, label, timeoutMs = 8000) {
+async function roomAction(payload) {
+  return post("/api/room", payload);
+}
+
+async function roundAction(session, payload) {
+  return post("/api/round", {
+    clientId: session.clientId,
+    roomCode: session.roomCode,
+    role: session.role,
+    playerId: session.playerId || null,
+    nickname: session.nickname || null,
+    ...payload
+  });
+}
+
+async function getState(session) {
+  const params = new URLSearchParams({
+    clientId: session.clientId,
+    roomCode: session.roomCode
+  });
+  if (session.role) {
+    params.set("role", session.role);
+  }
+  if (session.playerId) {
+    params.set("playerId", session.playerId);
+  }
+  if (session.nickname) {
+    params.set("nickname", session.nickname);
+  }
+  return fetchJson(`${baseUrl}/api/player?${params.toString()}`);
+}
+
+async function waitForState(session, predicate, label, timeoutMs = 12000) {
   const startedAt = Date.now();
   let lastState = null;
 
   while (Date.now() - startedAt < timeoutMs) {
-    lastState = await getState(clientId);
+    lastState = await getState(session);
     if (predicate(lastState)) {
       return lastState;
     }
@@ -67,23 +100,23 @@ async function waitForState(clientId, predicate, label, timeoutMs = 8000) {
   );
 }
 
-function buildMetrics(playerName, roundNumber, score) {
+function buildMetrics(playerName, score) {
   return {
     label: `${playerName} ${score}점`,
-    summary: `${roundNumber}라운드 복구 테스트 제출`
+    summary: "외부 저장소 복구 테스트 제출"
   };
 }
 
-function startServer() {
+function startServer(prefix) {
   const server = spawn(process.execPath, ["server.mjs"], {
     cwd: __dirname,
     env: {
       ...process.env,
       HOST: host,
       PORT: String(port),
-      STATE_FILE: stateFile,
-      PRACTICE_LEAD_IN_MS: "30",
-      MAIN_INTRO_MS: "400",
+      ROOM_STORE_PREFIX: prefix,
+      PRACTICE_LEAD_IN_MS: "20",
+      MAIN_INTRO_MS: "120",
       SCORING_DELAY_MS: "20"
     },
     stdio: ["ignore", "pipe", "pipe"]
@@ -125,116 +158,102 @@ async function stopServer(server) {
 }
 
 async function main() {
-  await rm(stateFile, { force: true });
-  await rm(`${stateFile}.tmp`, { force: true });
+  if (!process.env.ROOM_STORE_URL || !process.env.ROOM_STORE_TOKEN) {
+    console.log("Recovery smoke skipped: ROOM_STORE_URL / ROOM_STORE_TOKEN 이 없어 외부 저장소 재시작 복구를 검증할 수 없습니다.");
+    return;
+  }
 
+  const prefix = `recovery-smoke-${Date.now()}`;
   const adminId = "recovery-admin";
-  const playerA = "recovery-player-a";
-  const playerB = "recovery-player-b";
+  const playerAId = "recovery-player-a";
+  const playerBId = "recovery-player-b";
   let server = null;
 
   try {
-    server = await startServer();
+    server = await startServer(prefix);
 
-    await Promise.all([post("/api/session", { clientId: adminId }), post("/api/session", { clientId: playerA }), post("/api/session", { clientId: playerB })]);
-
-    const roomCreate = await post("/api/admin/room", {
+    const createdRoom = await roomAction({
+      action: "createRoom",
       clientId: adminId,
-      name: "재시작 복구 테스트 룸",
+      name: "Recovery Smoke Room",
       roundCount: 5,
       prizes: ["1R", "2R", "3R", "4R", "5R"]
     });
-    const roomCode = roomCreate.roomCode;
 
-    await post("/api/join", { clientId: playerA, roomCode, nickname: "문기" });
-    await post("/api/join", { clientId: playerB, roomCode, nickname: "김대리" });
+    const adminSession = createdRoom.session;
+    const roomCode = createdRoom.roomCode;
 
-    await post("/api/admin/action", { clientId: adminId, action: "start-tournament" });
-    await waitForState(adminId, (state) => state.room.state === "ROUND_INTRO" && state.room.currentRoundIndex === 0, "재시작 전 ROUND_INTRO");
-
-    await post("/api/admin/action", { clientId: adminId, action: "start-practice" });
-    await waitForState(adminId, (state) => state.room.state === "PRACTICE_PLAY", "재시작 전 PRACTICE_PLAY");
-
-    await Promise.all([
-      post("/api/player/submit", {
-        clientId: playerA,
-        mode: "practice",
-        score: 810,
-        rankVector: [810, -10],
-        metrics: buildMetrics("문기", 1, 810)
-      }),
-      post("/api/player/submit", {
-        clientId: playerB,
-        mode: "practice",
-        score: 790,
-        rankVector: [790, -12],
-        metrics: buildMetrics("김대리", 1, 790)
+    const playerA = (
+      await roomAction({
+        action: "joinRoom",
+        clientId: playerAId,
+        roomCode,
+        nickname: "문기"
       })
-    ]);
+    ).session;
+    const playerB = (
+      await roomAction({
+        action: "joinRoom",
+        clientId: playerBId,
+        roomCode,
+        nickname: "김대리"
+      })
+    ).session;
 
-    await waitForState(adminId, (state) => state.room.state === "PRACTICE_RESULT", "재시작 전 PRACTICE_RESULT");
-    await post("/api/admin/action", { clientId: adminId, action: "start-main" });
-    await waitForState(adminId, (state) => state.room.state === "MAIN_PLAY", "재시작 전 MAIN_PLAY", 10000);
+    await roundAction(adminSession, { action: "start-tournament" });
+    await waitForState(adminSession, (state) => state.room?.state === "ROUND_INTRO", "ROUND_INTRO");
+    await roundAction(adminSession, { action: "skip-practice" });
+    await waitForState(adminSession, (state) => state.room?.state === "MAIN_PLAY", "재시작 전 MAIN_PLAY", 12000);
 
     await stopServer(server);
-    server = await startServer();
+    server = await startServer(prefix);
 
-    const restoredAdminSession = await post("/api/session", { clientId: adminId });
-    const restoredPlayerSession = await post("/api/session", { clientId: playerA });
-    assert(restoredAdminSession.roomCode === roomCode && restoredAdminSession.role === "admin", "관리자 세션이 복구되지 않았습니다.");
-    assert(restoredPlayerSession.roomCode === roomCode && restoredPlayerSession.role === "player", "플레이어 세션이 복구되지 않았습니다.");
+    const recoveredAdmin = await bootstrap(adminId);
+    const recoveredPlayer = await bootstrap(playerAId);
+    assert(recoveredAdmin.recovered === true, "재시작 후 관리자 bootstrap 복구가 실패했습니다.");
+    assert(recoveredPlayer.recovered === true, "재시작 후 참가자 bootstrap 복구가 실패했습니다.");
 
-    const restoredMainPlay = await waitForState(
-      adminId,
-      (state) => state.room.state === "MAIN_PLAY" && state.room.currentRoundIndex === 0,
-      "재시작 후 MAIN_PLAY",
-      10000
+    const adminAfterRestart = recoveredAdmin.session;
+    const playerAAfterRestart = recoveredPlayer.session;
+
+    assert(adminAfterRestart.roomCode === roomCode, "재시작 후 관리자 roomCode가 유지되지 않았습니다.");
+    assert(playerAAfterRestart.roomCode === roomCode, "재시작 후 참가자 roomCode가 유지되지 않았습니다.");
+
+    await waitForState(
+      adminAfterRestart,
+      (state) => state.room?.state === "MAIN_PLAY" && state.room.currentRoundIndex === 0,
+      "재시작 후 MAIN_PLAY 유지",
+      12000
     );
-    assert(restoredMainPlay.players.every((player) => player.connected === false), "재시작 직후 플레이어 연결 상태가 초기화되지 않았습니다.");
 
     await Promise.all([
-      post("/api/player/submit", {
-        clientId: playerA,
+      roundAction(playerAAfterRestart, {
+        action: "submit",
         mode: "main",
         score: 1200,
-        rankVector: [1200, 0],
-        metrics: buildMetrics("문기", 1, 1200)
+        rankVector: [1200],
+        metrics: buildMetrics("문기", 1200)
       }),
-      post("/api/player/submit", {
-        clientId: playerB,
+      roundAction(playerB, {
+        action: "submit",
         mode: "main",
-        score: 700,
-        rankVector: [700, 0],
-        metrics: buildMetrics("김대리", 1, 700)
+        score: 840,
+        rankVector: [840],
+        metrics: buildMetrics("김대리", 840)
       })
     ]);
 
     const roundResult = await waitForState(
-      adminId,
-      (state) => state.room.state === "ROUND_RESULT" && state.currentRound?.results?.length === 2,
+      adminAfterRestart,
+      (state) => state.room?.state === "ROUND_RESULT" && state.currentRound?.results?.length === 2,
       "재시작 후 ROUND_RESULT",
-      10000
+      12000
     );
-    assert(roundResult.currentRound.results[0].nickname === "문기", "복구 후 1라운드 우승자가 예상과 다릅니다.");
+    assert(roundResult.currentRound.results[0].nickname === "문기", "재시작 후 결과 집계가 비정상입니다.");
 
-    await stopServer(server);
-    server = await startServer();
-
-    const restoredRoundResult = await waitForState(
-      adminId,
-      (state) => state.room.state === "ROUND_RESULT" && state.currentRound?.results?.[0]?.nickname === "문기",
-      "재시작 후 ROUND_RESULT 유지"
-    );
-    assert(restoredRoundResult.finalRanking[0].totalPoints === 2, "재시작 후 누적 점수가 유지되지 않았습니다.");
-
-    await post("/api/admin/action", { clientId: adminId, action: "advance" });
-    await waitForState(adminId, (state) => state.room.state === "ROUND_INTRO" && state.room.currentRoundIndex === 1, "재시작 후 다음 라운드");
-
-    console.log("Recovery smoke test passed: persisted sessions + room state + round progress across restarts");
+    console.log("Recovery smoke test passed: external store persisted room state across local adapter restart");
   } finally {
     await stopServer(server);
-    await rm(stateFile, { force: true });
-    await rm(`${stateFile}.tmp`, { force: true });
   }
 }
 

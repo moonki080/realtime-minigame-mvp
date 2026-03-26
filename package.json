@@ -8,6 +8,7 @@
   },
   "scripts": {
     "start": "node server.mjs",
+    "dev:vercel": "vercel dev --listen 4310",
     "smoke": "node smoke-test.mjs",
     "smoke:recovery": "node recovery-smoke-test.mjs"
   }

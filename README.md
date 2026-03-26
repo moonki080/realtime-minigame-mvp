@@ -1,166 +1,223 @@
-# 회식용 실시간 미니게임 플랫폼 MVP
+# Realtime Minigame MVP
 
-명세서 `codex_realtime_minigame_mvp_spec_v1.md` 기준으로 시작한 1차 구현입니다.
+Vercel 배포를 기준으로 다시 정리한 회식용 실시간 미니게임 MVP입니다.  
+핵심 구조는 `Vercel Functions(/api)` + 외부 KV/Redis 계열 저장소 + polling 기반 상태 동기화입니다.
 
-## 현재 구현 범위
+## 무엇이 바뀌었나
 
-- 단일 방 기준 실시간 상태 관리
-- 관리자 방 생성, 게임 재추첨, 특별상품 수정, 대회 시작
-- 관리자 일시정지/재개, 현재 라운드 재시작, 같은 방 새 대회 재오픈
-- 관리자 발표용 포커스 모드
-- 발표 전용 링크(`?room=방코드&display=1`) 기반 읽기 전용 대형 화면
-- 관리자 복구 코드 기반 새 기기 운영 권한 인계
-- 최근 접속 방 / 진행 중인 방 목록 기반 복구 허브
-- 종료 대회 아카이브 검색 및 리포트 재다운로드
-- 관리자 운영 가이드, 제출 대기 표시, 주요 액션 확인창
-- 화이트 베이스 UI, 역할 선택 홈, 모바일 관리자 하단 고정 액션 바
-- 세션 자동 복구 1초 타임아웃 기반 첫 진입 UX
-- 상대경로 / 현재 origin 기반 API · SSE 연결로 LAN 접속 지원
-- 관리자 최종 순위 CSV / 운영 로그 CSV / 대회 리포트 JSON export
-- 파일 기반 방/세션 상태 저장 및 서버 재시작 복구
-- 라운드 결과 / 최종 결과 포디움 발표 연출
-- 참가자 닉네임 입장, 시작 시점 인원 잠금, 시작 후 관전자 자동 전환
-- 연습판 -> 본게임 -> 라운드 결과 -> 최종 결과 상태 전이
-- 누적 점수 집계, 라운드 우승자, Top 3, 최종 순위
-- 재접속용 세션 복구 기반 구조
-- 8종 미니게임 클라이언트 구현
-  - 컬러 스냅
-  - GO / STOP 탭
-  - 숫자 헌터
-  - 점멸 패턴 기억
-  - 위치 기억
-  - 다른 하나 찾기
-  - 10초 멈춰
-  - 게이지 스톱
+- 장시간 실행되는 `server.mjs + runtime-state.json` 구조를 버리고 `/api/bootstrap`, `/api/room`, `/api/round`, `/api/player`, `/api/leaderboard` 중심으로 재구성했습니다.
+- 파일 저장을 제거하고 `ROOM_STORE_URL`, `ROOM_STORE_TOKEN`, `ROOM_STORE_PREFIX` 기반 외부 저장소를 사용하도록 바꿨습니다.
+- 첫 진입 화면은 무한 스피너 대신 `관리자 시작 / 참가자 입장 / 테스트 모드` 홈으로 고정했습니다.
+- 관리자/참가자/발표 화면은 SSE 대신 polling으로 상태를 동기화합니다.
+- 화이트 베이스 운영 대시보드 톤과 모바일 관리자 하단 액션 바를 유지한 채 새 API 구조에 맞췄습니다.
 
-## 실행 방법
+## 현재 동작 범위
+
+- 관리자 방 생성
+- 참가자 방 코드 입장
+- 관리자 복구 코드 기반 권한 복구
+- 발표 전용 링크 `?room=ROOM&display=1`
+- 5라운드 / 8라운드 운영
+- 특별상품 사전 입력 및 라운드별 수정
+- `ROUND_INTRO -> PRACTICE_PLAY -> PRACTICE_RESULT -> MAIN_INTRO -> MAIN_PLAY -> SCORING -> ROUND_RESULT -> FINAL_RESULT`
+- 최종 결과 발표 및 같은 방 새 대회 시작
+- 8종 미니게임 클라이언트
+
+## 프로젝트 구조
+
+```text
+realtime-minigame-mvp/
+  api/
+    bootstrap.mjs
+    room.mjs
+    round.mjs
+    player.mjs
+    leaderboard.mjs
+  lib/
+    core/
+    store/
+    utils/
+  public/
+    app.mjs
+    games.mjs
+    styles.css
+    index.html
+  shared/
+    gameData.mjs
+  server.mjs
+  vercel.json
+```
+
+`server.mjs` 는 배포 서버가 아니라 로컬 확인용 adapter 입니다. 실제 배포 기준 런타임은 `/api/*.mjs` 입니다.
+
+## 로컬 실행 방법
+
+### 권장: Vercel dev
+
+```bash
+cd /Users/moonkilee/Documents/New\ project/realtime-minigame-mvp
+vercel link
+vercel env pull .env.local
+npm run dev:vercel
+```
+
+또는 직접:
+
+```bash
+vercel dev --listen 4310
+```
+
+### fallback: 로컬 adapter
+
+Vercel CLI 없이 화면과 API를 빠르게 확인할 때:
 
 ```bash
 cd /Users/moonkilee/Documents/New\ project/realtime-minigame-mvp
 npm start
 ```
 
-기본 주소:
+기본 접속 주소:
 
 ```text
 http://127.0.0.1:4310
 ```
 
-앱은 첫 진입 시 역할 선택 홈을 먼저 렌더링하고, 이전 세션 복구는 백그라운드에서만 짧게 시도합니다.
-관리자 시작은 `관리자 시작 -> 방 생성 -> 대기실 -> 대회 시작` 흐름으로 들어가며,
-테스트 모드는 테스트용 방을 바로 만들어 빠르게 점검할 수 있습니다.
+## 환경변수 설정
 
-전체 흐름 스모크 테스트:
+예시는 [.env.example](/Users/moonkilee/Documents/New project/realtime-minigame-mvp/.env.example)에 있습니다.
 
-```bash
-npm run smoke
-```
+필수:
 
-재시작 복구 스모크 테스트:
+- `ROOM_STORE_URL`: Upstash Redis REST URL 또는 호환 KV/Redis REST endpoint
+- `ROOM_STORE_TOKEN`: 저장소 Bearer token
+- `ROOM_STORE_PREFIX`: 프로젝트별 key prefix
 
-```bash
-npm run smoke:recovery
-```
+선택:
 
-## 배포 / 운영
-
-기본 서버는 `HOST=0.0.0.0`, `PORT=4310` 기준으로 실행되며 로컬에서는 `http://127.0.0.1:4310`로 접속하면 됩니다.
-프런트엔드의 API 요청, SSE 연결, 초대 링크는 모두 현재 접속 origin 기준으로 동작하므로,
-같은 Wi-Fi의 다른 기기에서는 `http://사설IP:4310` 형식으로 접속하면 됩니다.
-
-헬스체크:
-
-```text
-GET /healthz
-GET /readyz
-```
-
-- `/healthz`: 프로세스 생존 여부, 방 수, 세션 수, SSE 연결 수를 반환합니다.
-- `/readyz`: 종료 중이 아니면 `200`, graceful shutdown 중이면 `503`을 반환합니다.
-
-주요 환경변수:
-
-- `HOST`: 서버 바인드 주소. 기본값 `0.0.0.0`
-- `PORT`: 서버 포트. 기본값 `4310`
-- `PERSIST_STATE`: `0`이면 상태 저장 비활성화
-- `STATE_FILE`: 상태 저장 파일 경로. 기본값 `./data/runtime-state.json`
-- `PRACTICE_LEAD_IN_MS`: 연습 시작 전 리드인
-- `MAIN_INTRO_MS`: 본게임 카운트다운 길이
+- `HOST`: 로컬 adapter 바인드 주소. 기본값 `0.0.0.0`
+- `PORT`: 로컬 adapter 포트. 기본값 `4310`
+- `PRACTICE_LEAD_IN_MS`: 연습 리드인 시간
+- `MAIN_INTRO_MS`: 본게임 카운트다운 시간
 - `SCORING_DELAY_MS`: 점수 집계 지연
-- `EVENT_LOG_LIMIT`: 운영 로그 최대 보존 개수. 기본값 `120`
-- `ARCHIVE_LIMIT`: 보존할 종료 대회 아카이브 최대 개수. 기본값 `80`
-- `SHUTDOWN_GRACE_MS`: 종료 처리 유예 시간. 기본값 `8000`
+- `ROOM_TTL_SECONDS`: room key TTL
 
-Docker 실행 예시:
+중요:
 
-```bash
-docker build -t realtime-minigame-mvp .
-docker run --rm -p 4310:4310 realtime-minigame-mvp
-```
-
-프로세스 종료 시에는 SSE 클라이언트에 종료 안내 이벤트를 보낸 뒤 연결을 정리하고, `SIGTERM` / `SIGINT` 기준으로 graceful shutdown을 수행합니다.
+- 배포 환경에서는 외부 저장소 환경변수가 사실상 필수입니다.
+- 환경변수가 없으면 로컬 adapter 에서만 인메모리 fallback 으로 동작합니다.
+- 인메모리 fallback 은 프로세스 재시작 시 상태가 유지되지 않습니다.
 
 ## LAN 테스트 방법
 
-1. 서버 실행
-
-```bash
-cd /Users/moonkilee/Documents/New\ project/realtime-minigame-mvp
-npm start
-```
-
-2. 관리자용 PC에서 사설 IP 확인
+1. 관리자 기기에서 `npm run dev:vercel` 또는 `npm start`
+2. 관리자 기기의 사설 IP 확인
 
 ```bash
 ipconfig getifaddr en0
 ```
 
-Wi-Fi가 `en1`인 환경이면 `en1`로 바꿔 확인합니다.
-
 3. 관리자 기기에서 `http://127.0.0.1:4310` 또는 `http://내사설IP:4310` 접속
-4. 첫 화면에서 `관리자 시작` 선택 후 방 생성
-5. 같은 Wi-Fi의 다른 휴대폰/노트북에서 `http://내사설IP:4310` 접속
-6. `참가자 입장`으로 같은 방 코드 입장
-7. 관리자 대기실에서 참가자 수 반영 확인 후 `대회 시작`
-8. `연습 시작` 또는 `연습 건너뛰기`, `본게임 시작`, `최종 결과 공개` 흐름 확인
+4. 홈에서 `관리자 시작` 선택
+5. 방 생성 후 대기실 진입 확인
+6. 다른 기기에서 같은 Wi-Fi로 `http://내사설IP:4310` 접속
+7. `참가자 입장`으로 방 코드 입력
+8. 관리자 화면 참가자 수 반영 확인
+9. `대회 시작 -> 연습 시작/건너뛰기 -> 본게임 -> 결과 공개` 흐름 확인
 
 확인 포인트:
 
-- 첫 화면이 즉시 역할 선택 홈으로 보이는지
-- 관리자 방 생성 후 대기실이 바로 열리는지
-- 다른 기기 참가자가 관리자 화면 참가자 수에 즉시 반영되는지
-- 모바일 관리자 화면에서 하단 고정 액션 바로 주요 진행 버튼을 누를 수 있는지
-- 연습판 -> 본게임 -> 결과 흐름이 실제로 이어지는지
+- 첫 화면이 즉시 역할 선택 홈으로 뜨는지
+- 모바일에서도 관리자 방 생성이 되는지
+- 참가자 수가 polling으로 반영되는지
+- 모바일 관리자 하단 액션 바 버튼이 잘리지 않는지
+- 같은 origin / 상대경로 기반으로 다른 기기에서도 정상 입장되는지
 
-## 구조
+## Smoke Test
 
-- `server.mjs`: 파일 기반 상태 저장을 지원하는 방/세션 서버, SSE 상태 동기화, 라운드 엔진
-- `shared/gameData.mjs`: 공용 게임 메타데이터와 챌린지 생성기
-- `public/app.mjs`: 역할 선택 홈, 세션/복구 UX, 관리자/참가자/관전자 화면 렌더링
-- `public/games.mjs`: 8종 게임 플레이 로직
-- `public/styles.css`: 화이트 베이스 대시보드 스타일, 모바일 관리자 액션 바
-- `public/index.html`: 첫 진입 기본 마크업
-- `smoke-test.mjs`: 전체 대회 흐름 자동 검증
-- `Dockerfile`: 컨테이너 배포용 실행 정의
+기본 흐름 검증:
 
-## 이번 수정 포인트
+```bash
+npm run smoke
+```
 
-- 첫 진입 기본 화면을 무한 스피너 대신 역할 선택 홈으로 변경
-- 세션 자동 복구를 백그라운드 1초 타임아웃으로 제한
-- 관리자 방 생성 직후 대기실 상태가 즉시 동기화되도록 수정
-- 관리자 모바일 화면에 하단 고정 액션 바 추가
-- 전체 UI를 화이트/블루 베이스 운영 대시보드 톤으로 개편
-- 런타임 네트워크 경로를 현재 origin 기준으로 유지해 LAN 접속 안정성 강화
+이 스크립트는 아래를 확인합니다.
 
-## 참고 메모
+- bootstrap 홈 응답
+- 관리자 방 생성
+- 참가자 입장
+- 발표 화면 bootstrap
+- 연습판 / 본게임 / 라운드 결과 / 최종 결과
+- leaderboard 응답
+- reset-room
 
-- 기본 설정에서는 방/세션 상태를 파일로 저장해 재시작 시 복구합니다. 단, 프로세스가 비정상 종료된 시점 직전의 아주 짧은 구간은 유실될 수 있습니다.
-- QR 이미지는 외부 QR 이미지 API를 사용합니다.
-- 보안 검증보다는 실제 행사 진행 흐름을 빠르게 검증하는 MVP에 초점을 맞췄습니다.
-- 개발 검증용으로 `PRACTICE_LEAD_IN_MS`, `MAIN_INTRO_MS`, `SCORING_DELAY_MS` 환경변수로 고정 대기 시간을 줄일 수 있습니다.
-- 디버그/검증용으로 `GET /api/state?clientId=...` 엔드포인트를 제공합니다.
-- 랜딩 화면 복구 허브용으로 `GET /api/rooms` 엔드포인트를 제공합니다.
-- 랜딩 화면 아카이브 검색용으로 `GET /api/archives`, `GET /api/archives/report?id=...` 엔드포인트를 제공합니다.
-- 관리자 export/연동용으로 `GET /api/admin/report?clientId=...` 엔드포인트를 제공합니다.
-- 현재 관리자 화면에는 새 기기 인계를 위한 관리자 복구 코드가 표시되며, 랜딩 화면의 복구 폼으로 운영 권한을 이어받을 수 있습니다.
-- 라이브 플레이 중 일시정지는 아직 공정성 보장을 위해 `제출이 시작되기 전` 단계만 안전하게 허용합니다. 이미 제출이 나온 경우에는 `라운드 재시작`을 사용합니다.
+외부 저장소 재시작 복구 검증:
+
+```bash
+npm run smoke:recovery
+```
+
+주의:
+
+- 이 테스트는 `ROOM_STORE_URL`, `ROOM_STORE_TOKEN` 이 설정된 경우에만 실제 재시작 복구를 검증합니다.
+- 외부 저장소가 없으면 skip 메시지를 출력하고 종료합니다.
+
+## 배포 방법
+
+1. Vercel 프로젝트 연결
+
+```bash
+vercel link
+```
+
+2. 환경변수 등록
+
+```text
+ROOM_STORE_URL
+ROOM_STORE_TOKEN
+ROOM_STORE_PREFIX
+```
+
+3. 필요하면 로컬로 환경변수 pull
+
+```bash
+vercel env pull .env.local
+```
+
+4. 배포
+
+```bash
+vercel --prod
+```
+
+## Vercel 배포 후 확인 방법
+
+1. 배포 URL의 `/` 접속
+2. 홈 화면에서 역할 선택 3개 버튼 확인
+3. 모바일에서 관리자 시작 후 방 생성
+4. 다른 기기에서 참가자 입장
+5. 관리자 `대회 시작`
+6. 연습판 / 본게임 / 결과 화면 진행 확인
+7. 발표 화면은 `?room=ROOMCODE&display=1` 로 확인
+
+## 문제 발생 시 점검 포인트
+
+- 방 생성은 되는데 상태가 유지되지 않으면 `ROOM_STORE_URL`, `ROOM_STORE_TOKEN` 설정을 먼저 확인합니다.
+- 로컬 adapter 에서는 재시작 복구가 안 되는 것이 정상입니다. 외부 저장소가 있어야 합니다.
+- 다른 기기 접속이 안 되면 서버를 `0.0.0.0` 으로 바인드했는지와 같은 Wi-Fi 인지 확인합니다.
+- 배포 환경에서 polling 응답이 늦으면 함수 로그와 외부 저장소 지연을 확인합니다.
+- 관리자/참가자 복구가 기대와 다르면 같은 브라우저의 `clientId` 유지 여부를 먼저 확인합니다.
+
+## API 개요
+
+- `POST /api/bootstrap`: 홈 초기화, 세션 복구
+- `POST /api/room`: `createRoom`, `joinRoom`, `recoverAdmin`, `getRoomSummary`
+- `POST /api/round`: 관리자 액션, 플레이 제출
+- `GET /api/player`: 관리자/참가자/발표 화면 polling 상태
+- `GET /api/leaderboard`: 라운드 결과 또는 최종 결과
+
+## 남아 있는 제약사항
+
+- 외부 저장소가 없으면 재시작 복구는 지원되지 않습니다.
+- bootstrap 복구는 현재 room 목록을 순회해 찾는 방식이라 방 수가 매우 많아지면 비효율적일 수 있습니다.
+- QR 이미지는 외부 QR 이미지 서비스를 사용합니다.
+- polling 기반 MVP라 완전 실시간 체감은 SSE/WebSocket 보다 느릴 수 있습니다.

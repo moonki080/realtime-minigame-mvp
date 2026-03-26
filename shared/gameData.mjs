@@ -28,7 +28,6 @@ export const ROOM_STATES = [
   "PRACTICE_RESULT",
   "MAIN_INTRO",
   "MAIN_PLAY",
-  "PAUSED",
   "SCORING",
   "ROUND_RESULT",
   "FINAL_RESULT",

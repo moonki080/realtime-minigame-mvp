@@ -4,11 +4,14 @@ import { mountGameController } from "./games.mjs";
 const app = document.querySelector("#app");
 const defaultStorageKey = "realtime-minigame-client-id";
 const displayStorageKey = "realtime-minigame-display-client-id";
+const defaultSessionStorageKey = "realtime-minigame-session";
+const displaySessionStorageKey = "realtime-minigame-display-session";
 const presentationStorageKey = "realtime-minigame-presentation-mode";
 const recentRoomsStorageKey = "realtime-minigame-recent-rooms";
 const params = new URLSearchParams(window.location.search);
 const isDisplayModeParam = params.get("display") === "1";
 const storageKey = isDisplayModeParam ? displayStorageKey : defaultStorageKey;
+const sessionStorageKey = isDisplayModeParam ? displaySessionStorageKey : defaultSessionStorageKey;
 
 const store = {
   clientId: null,
@@ -26,7 +29,8 @@ const store = {
   actionState: null,
   actionTimer: null,
   sessionPromise: null,
-  stream: null,
+  pollTimer: null,
+  pollInFlight: false,
   activeController: null,
   activeInteractiveKey: null,
   activeGameNode: null,
@@ -49,7 +53,6 @@ const ROOM_STATE_LABELS = {
   PRACTICE_RESULT: "연습 결과",
   MAIN_INTRO: "본게임 카운트다운",
   MAIN_PLAY: "본게임 진행",
-  PAUSED: "일시정지",
   SCORING: "점수 집계",
   ROUND_RESULT: "라운드 결과",
   FINAL_RESULT: "최종 결과",
@@ -149,6 +152,45 @@ function setBanner(type, message) {
 
 function clearBanner() {
   store.banner = null;
+}
+
+function loadPersistedSession() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(sessionStorageKey) || "null");
+    if (!parsed || typeof parsed !== "object") {
+      return null;
+    }
+    return {
+      clientId: parsed.clientId || null,
+      roomCode: parsed.roomCode || null,
+      role: parsed.role || null,
+      playerId: parsed.playerId || null,
+      nickname: parsed.nickname || null
+    };
+  } catch {
+    return null;
+  }
+}
+
+function persistSession() {
+  if (!store.session?.roomCode) {
+    localStorage.removeItem(sessionStorageKey);
+    return;
+  }
+  localStorage.setItem(
+    sessionStorageKey,
+    JSON.stringify({
+      clientId: store.session.clientId,
+      roomCode: store.session.roomCode,
+      role: store.session.role,
+      playerId: store.session.playerId,
+      nickname: store.session.nickname
+    })
+  );
+}
+
+function clearPersistedSession() {
+  localStorage.removeItem(sessionStorageKey);
 }
 
 function clearActionTimer() {
@@ -318,31 +360,37 @@ function upsertRoomDirectory(roomEntry) {
 }
 
 async function refreshRoomDirectory() {
-  const data = await fetchJson("/api/rooms");
-  store.roomDirectory = Array.isArray(data.rooms) ? data.rooms : [];
+  store.roomDirectory = [];
   return store.roomDirectory;
 }
 
 async function refreshArchiveList(query = store.archiveQuery) {
   store.archiveQuery = String(query || "").trim();
-  const params = new URLSearchParams();
-  if (store.archiveQuery) {
-    params.set("q", store.archiveQuery);
-  }
-  const queryString = params.toString();
-  const data = await fetchJson(`/api/archives${queryString ? `?${queryString}` : ""}`);
-  store.archiveList = Array.isArray(data.archives) ? data.archives : [];
+  store.archiveList = [];
   return store.archiveList;
 }
 
 async function refreshSession(options = {}) {
-  const payload = { clientId: store.clientId };
-  if (store.displayMode && store.prefilledRoomCode) {
-    payload.roomCode = store.prefilledRoomCode;
-    payload.role = "display";
+  const payload = {
+    clientId: store.clientId,
+    roomCode: store.session?.roomCode || store.prefilledRoomCode || null,
+    role: store.displayMode ? "display" : store.session?.role || null,
+    playerId: store.session?.playerId || null,
+    nickname: store.session?.nickname || store.joinNickname || null,
+    display: store.displayMode
+  };
+  const data = await postJson("/api/bootstrap", payload, options);
+  store.session = data.session || null;
+  if (data.snapshot?.room) {
+    applySnapshot(data.snapshot);
+  } else if (!data.recovered) {
+    store.snapshot = null;
+    if (!store.session?.roomCode) {
+      clearPersistedSession();
+    }
   }
-  store.session = await postJson("/api/session", payload, options);
-  return store.session;
+  persistSession();
+  return data;
 }
 
 async function ensureSession(options = {}) {
@@ -361,12 +409,6 @@ async function ensureSession(options = {}) {
   const promise = refreshSession({
     signal: controller?.signal
   })
-    .then((session) => {
-      if (!store.stream && store.clientId) {
-        connectStream();
-      }
-      return session;
-    })
     .finally(() => {
       if (timerId) {
         clearTimeout(timerId);
@@ -388,6 +430,7 @@ function applySessionFromViewer(viewer) {
     playerId: viewer.playerId,
     nickname: viewer.nickname
   };
+  persistSession();
 }
 
 function applySnapshot(snapshot) {
@@ -403,60 +446,81 @@ function applySnapshot(snapshot) {
 }
 
 async function refreshCurrentState() {
-  if (!store.clientId) {
+  if (!store.clientId || !store.session?.roomCode) {
     return null;
   }
 
-  const state = await fetchJson(`/api/state?clientId=${encodeURIComponent(store.clientId)}`);
+  const params = new URLSearchParams({
+    clientId: store.clientId,
+    roomCode: store.session.roomCode
+  });
+  if (store.session?.playerId) {
+    params.set("playerId", store.session.playerId);
+  }
+  if (store.session?.role) {
+    params.set("role", store.session.role);
+  }
+  if (store.session?.nickname) {
+    params.set("nickname", store.session.nickname);
+  }
+
+  const state = await fetchJson(`/api/player?${params.toString()}`);
   if (state.room) {
     applySnapshot(state);
     return state;
   }
 
+  stopPolling();
   store.snapshot = null;
-  if (state.viewer) {
-    applySessionFromViewer(state.viewer);
-  }
+  store.session = null;
+  clearPersistedSession();
   return state;
 }
 
-function connectStream() {
-  if (store.stream) {
-    store.stream.close();
+function stopPolling() {
+  if (store.pollTimer) {
+    clearTimeout(store.pollTimer);
+    store.pollTimer = null;
+  }
+  store.pollInFlight = false;
+}
+
+function schedulePoll(delay = 1000) {
+  if (!store.session?.roomCode) {
+    return;
   }
 
-  const stream = new EventSource(`/events?clientId=${encodeURIComponent(store.clientId)}`);
-  store.stream = stream;
+  if (store.pollTimer) {
+    clearTimeout(store.pollTimer);
+  }
 
-  stream.addEventListener("state", (event) => {
-    applySnapshot(JSON.parse(event.data));
-    render();
-  });
+  store.pollTimer = window.setTimeout(async () => {
+    store.pollTimer = null;
+    if (store.pollInFlight || !store.session?.roomCode) {
+      return;
+    }
 
-  stream.addEventListener("serverClosing", (event) => {
-    const payload = JSON.parse(event.data || "{}");
-    setBanner("error", payload.reason || "서버가 재시작 중입니다. 잠시 후 다시 접속해 주세요.");
-  });
+    store.pollInFlight = true;
+    try {
+      await refreshCurrentState();
+      render();
+    } catch {
+      renderCountdowns();
+    } finally {
+      const shouldContinue = Boolean(store.session?.roomCode) && Boolean(store.snapshot?.room);
+      store.pollInFlight = false;
+      if (shouldContinue) {
+        schedulePoll(1000);
+      }
+    }
+  }, delay);
+}
 
-  stream.addEventListener("roomClosed", () => {
-    store.snapshot = null;
-    store.session = {
-      ...store.session,
-      roomCode: null,
-      role: null,
-      playerId: null
-    };
-    destroyActiveController();
-    store.entryView = "home";
-    updateRoomQuery("");
-    setBanner("error", "방이 종료되었거나 더 이상 존재하지 않습니다.");
-    void refreshRoomDirectory().then(render).catch(() => {});
-    void refreshArchiveList().then(render).catch(() => {});
-  });
-
-  stream.onerror = () => {
-    renderCountdowns();
-  };
+function startPolling() {
+  if (store.pollTimer || store.pollInFlight || !store.session?.roomCode) {
+    return;
+  }
+  schedulePoll(1000);
 }
 
 function updateRoomQuery(roomCode) {
@@ -495,104 +559,6 @@ function startClockTicker() {
   store.clockTimer = setInterval(renderCountdowns, 150);
 }
 
-function formatExportStamp(timestamp = Date.now()) {
-  return new Date(timestamp).toISOString().replaceAll(":", "-").replaceAll(".", "-");
-}
-
-function csvEscape(value) {
-  const normalized = String(value ?? "");
-  if (normalized.includes('"') || normalized.includes(",") || normalized.includes("\n")) {
-    return `"${normalized.replaceAll('"', '""')}"`;
-  }
-  return normalized;
-}
-
-function buildCsv(rows) {
-  return rows.map((row) => row.map((cell) => csvEscape(cell)).join(",")).join("\n");
-}
-
-function downloadTextFile(filename, content, mimeType) {
-  const blob = new Blob([content], { type: mimeType });
-  const url = URL.createObjectURL(blob);
-  const anchor = document.createElement("a");
-  anchor.href = url;
-  anchor.download = filename;
-  document.body.append(anchor);
-  anchor.click();
-  anchor.remove();
-  window.setTimeout(() => URL.revokeObjectURL(url), 0);
-}
-
-function getExportRoomCode(source = store.snapshot) {
-  return source?.room?.code || getRoom(store.snapshot)?.code || "ROOM";
-}
-
-function getExportFilename(prefix, extension, source) {
-  return `${prefix}-${getExportRoomCode(source)}-${formatExportStamp()}.${extension}`;
-}
-
-function buildFinalRankingCsv(report) {
-  const rows = [
-    ["rank", "nickname", "total_points", "round_wins", "second_places"]
-  ];
-  report.finalRanking.forEach((entry) => {
-    rows.push([entry.rank, entry.nickname, entry.totalPoints, entry.roundWins, entry.secondPlaces]);
-  });
-  return buildCsv(rows);
-}
-
-function buildEventLogCsv(report) {
-  const rows = [["time", "message"]];
-  report.eventLog.forEach((entry) => {
-    rows.push([new Date(entry.at).toISOString(), entry.message]);
-  });
-  return buildCsv(rows);
-}
-
-async function handleExportAction(kind) {
-  const report = await fetchJson(`/api/admin/report?clientId=${encodeURIComponent(store.clientId)}`);
-
-  if (kind === "final-csv") {
-    if (!report.finalRanking?.length) {
-      throw new Error("아직 최종 순위가 없어 CSV를 만들 수 없습니다.");
-    }
-    downloadTextFile(getExportFilename("final-ranking", "csv", report), `\uFEFF${buildFinalRankingCsv(report)}`, "text/csv;charset=utf-8");
-    setBanner("success", "최종 순위 CSV를 내려받았습니다.");
-    return;
-  }
-
-  if (kind === "log-csv") {
-    if (!report.eventLog?.length) {
-      throw new Error("내보낼 운영 로그가 없습니다.");
-    }
-    downloadTextFile(getExportFilename("event-log", "csv", report), `\uFEFF${buildEventLogCsv(report)}`, "text/csv;charset=utf-8");
-    setBanner("success", "운영 로그 CSV를 내려받았습니다.");
-    return;
-  }
-
-  if (kind === "report-json") {
-    downloadTextFile(
-      getExportFilename("tournament-report", "json", report),
-      `${JSON.stringify(report, null, 2)}\n`,
-      "application/json;charset=utf-8"
-    );
-    setBanner("success", "대회 리포트 JSON을 내려받았습니다.");
-    return;
-  }
-
-  throw new Error("지원하지 않는 export 액션입니다.");
-}
-
-async function downloadArchiveReport(archiveId) {
-  const report = await fetchJson(`/api/archives/report?id=${encodeURIComponent(archiveId)}`);
-  downloadTextFile(
-    getExportFilename("tournament-archive", "json", report),
-    `${JSON.stringify(report, null, 2)}\n`,
-    "application/json;charset=utf-8"
-  );
-  setBanner("success", "아카이브 리포트 JSON을 내려받았습니다.");
-}
-
 function pillClassForPlayer(player) {
   if (player.spectator) {
     return "neutral";
@@ -626,7 +592,7 @@ function getEffectiveRoomState(snapshot) {
   if (!room) {
     return null;
   }
-  return room.state === "PAUSED" ? room.pauseInfo?.phase || room.state : room.state;
+  return room.state;
 }
 
 function getPendingPlayers(snapshot) {
@@ -712,10 +678,6 @@ function getPlayerProgressBadge(snapshot, player) {
 
   if (effectiveState === "MAIN_INTRO") {
     return { label: "본게임 곧 시작", tone: "teal", pending: false };
-  }
-
-  if (room.state === "PAUSED") {
-    return { label: "일시정지", tone: "neutral", pending: false };
   }
 
   return null;
@@ -1231,8 +1193,6 @@ function renderLanding() {
         <div class="subtle-divider"></div>
         ${renderHomeEntryPanel()}
       </section>
-      ${renderRecoveryHub()}
-      ${renderArchiveHub()}
     </div>
   `;
 }
@@ -1653,28 +1613,6 @@ function renderAdminOperationsPanel(snapshot) {
         )
       );
       break;
-    case "PAUSED":
-      badge = "Paused";
-      tone = "neutral";
-      title = "진행이 멈춰 있습니다. 재개 또는 라운드 재시작을 선택하세요.";
-      body = room.pauseInfo?.restartOnResume
-        ? "재개하면 현재 phase가 처음부터 다시 시작됩니다."
-        : "재개하면 현재 상태에서 이어서 진행됩니다.";
-      detailCards.push(
-        renderOpsDetailCard(
-          "멈춘 상태",
-          `${getPhaseLabel(room.pauseInfo?.phase)} 상태에서 일시정지되었습니다.`,
-          renderTextChipRow(
-            [
-              getPhaseLabel(room.pauseInfo?.phase),
-              room.pauseInfo?.restartOnResume ? "재개 시 처음부터" : "재개 시 이어서"
-            ],
-            "neutral"
-          ),
-          "neutral"
-        )
-      );
-      break;
     default:
       break;
   }
@@ -1752,8 +1690,6 @@ function renderPresentationBoard(snapshot) {
   const round = getRound(snapshot);
   const inviteUrl = `${window.location.origin}/?room=${room.code}`;
   const activeCount = snapshot.players.filter((player) => !player.spectator).length;
-  const pauseInfo = room.pauseInfo;
-
   if (room.state === "WAITING") {
     return `
       <section class="panel presentation-board presentation-board--waiting">
@@ -1811,8 +1747,8 @@ function renderPresentationBoard(snapshot) {
     `;
   }
 
-  if (["MAIN_INTRO", "PRACTICE_PLAY", "MAIN_PLAY", "SCORING", "PRACTICE_RESULT", "PAUSED"].includes(room.state) && round) {
-    const effectiveState = room.state === "PAUSED" ? pauseInfo?.phase : room.state;
+  if (["MAIN_INTRO", "PRACTICE_PLAY", "MAIN_PLAY", "SCORING", "PRACTICE_RESULT"].includes(room.state) && round) {
+    const effectiveState = room.state;
     const deadline =
       effectiveState === "PRACTICE_PLAY"
         ? round.practiceEndsAt
@@ -1833,11 +1769,7 @@ function renderPresentationBoard(snapshot) {
         <div class="presentation-hero">
           <span class="presentation-kicker">${getPhaseLabel(effectiveState)}</span>
           <h2>${escapeHtml(round.title)}</h2>
-          <p>${
-            room.state === "PAUSED"
-              ? `${getPhaseLabel(pauseInfo?.phase)} 상태에서 잠시 멈췄습니다.`
-              : escapeHtml(round.description)
-          }</p>
+          <p>${escapeHtml(round.description)}</p>
         </div>
         <div class="presentation-metrics">
           <div class="presentation-metric">
@@ -1995,7 +1927,7 @@ function renderMainIntroAdminStage(snapshot) {
       <div class="panel-header">
         <div>
           <h2>${escapeHtml(round.title)} 본게임 카운트다운</h2>
-          <p class="muted">곧 본게임이 자동으로 시작됩니다. 필요하면 잠시 멈추거나 라운드를 다시 열 수 있습니다.</p>
+          <p class="muted">곧 본게임이 자동으로 시작됩니다. 필요하면 라운드를 다시 열어 재안내할 수 있습니다.</p>
         </div>
         <span class="pill accent">ADM-05</span>
       </div>
@@ -2005,7 +1937,6 @@ function renderMainIntroAdminStage(snapshot) {
       </div>
       <div class="subtle-divider"></div>
       <div class="admin-actions">
-        <button type="button" class="secondary" data-action="admin" data-admin-action="pause">일시정지</button>
         <button type="button" class="ghost" data-action="admin" data-admin-action="restart-round">라운드 재시작</button>
       </div>
     </section>
@@ -2050,14 +1981,7 @@ function renderLiveMonitorStage(snapshot) {
       </div>
       <div class="subtle-divider"></div>
       <div class="admin-actions">
-        ${
-          room.state === "SCORING"
-            ? `<button type="button" class="ghost" data-action="admin" data-admin-action="restart-round">라운드 재시작</button>`
-            : `
-              <button type="button" class="secondary" data-action="admin" data-admin-action="pause">일시정지</button>
-              <button type="button" class="ghost" data-action="admin" data-admin-action="restart-round">라운드 재시작</button>
-            `
-        }
+        <button type="button" class="ghost" data-action="admin" data-admin-action="restart-round">라운드 재시작</button>
       </div>
     </section>
   `;
@@ -2251,44 +2175,9 @@ function renderFinalStage(snapshot) {
         <span class="pill accent">ADM-07</span>
       </div>
       ${renderFinalCeremony(snapshot)}
-      <div class="soft-card">
-        <h3>운영 자료 내보내기</h3>
-        <p class="muted">최종 순위 CSV, 운영 로그 CSV, 라운드별 히스토리가 포함된 리포트 JSON을 저장할 수 있습니다.</p>
-        <div class="admin-actions">
-          <button type="button" class="secondary" data-action="export" data-export-kind="final-csv">최종 순위 CSV</button>
-          <button type="button" class="secondary" data-action="export" data-export-kind="log-csv">운영 로그 CSV</button>
-          <button type="button" class="ghost" data-action="export" data-export-kind="report-json">대회 리포트 JSON</button>
-        </div>
-      </div>
       <div class="admin-actions">
         ${room.state === "FINAL_RESULT" ? '<button type="button" class="secondary" data-action="admin" data-admin-action="advance">대회 종료</button>' : ""}
         <button type="button" class="primary" data-action="admin" data-admin-action="reset-room">같은 방으로 새 대회</button>
-      </div>
-    </section>
-  `;
-}
-
-function renderPausedStage(snapshot) {
-  const room = getRoom(snapshot);
-  const round = getRound(snapshot);
-  const pauseInfo = room.pauseInfo;
-  return `
-    <section class="panel">
-      <div class="panel-header">
-        <div>
-          <h2>진행 일시정지</h2>
-          <p class="muted">${escapeHtml(round?.title || room.name)} · ${getPhaseLabel(pauseInfo?.phase)} 상태에서 멈췄습니다.</p>
-        </div>
-        <span class="pill accent">ADM-PAUSE</span>
-      </div>
-      <div class="timeline-card">
-        <h3>${pauseInfo?.restartOnResume ? "재개 시 현재 phase가 처음부터 다시 시작됩니다." : "재개하면 현재 상태에서 이어서 진행됩니다."}</h3>
-        <p>${pauseInfo?.phase === "MAIN_PLAY" || pauseInfo?.phase === "PRACTICE_PLAY" ? "공정성을 위해 제출이 시작되기 전 단계만 안전하게 일시정지할 수 있습니다." : "운영자가 재개 버튼을 눌러야 다시 진행됩니다."}</p>
-      </div>
-      <div class="subtle-divider"></div>
-      <div class="admin-actions">
-        <button type="button" class="primary" data-action="admin" data-admin-action="resume">재개</button>
-        <button type="button" class="ghost" data-action="admin" data-admin-action="restart-round">라운드 재시작</button>
       </div>
     </section>
   `;
@@ -2309,8 +2198,6 @@ function renderAdminStage(snapshot) {
       return renderLiveMonitorStage(snapshot);
     case "PRACTICE_RESULT":
       return renderPracticeResultStage(snapshot);
-    case "PAUSED":
-      return renderPausedStage(snapshot);
     case "ROUND_RESULT":
       return renderRoundResultStage(snapshot);
     case "FINAL_RESULT":
@@ -2353,23 +2240,12 @@ function getAdminMobileActions(snapshot) {
         { label: "라운드 재시작", action: "restart-round", tone: "ghost" }
       ];
     case "MAIN_INTRO":
-      return [
-        { label: "일시정지", action: "pause", tone: "secondary" },
-        { label: "라운드 재시작", action: "restart-round", tone: "ghost" }
-      ];
+      return [{ label: "라운드 재시작", action: "restart-round", tone: "ghost" }];
     case "PRACTICE_PLAY":
     case "MAIN_PLAY":
-      return [
-        { label: "일시정지", action: "pause", tone: "secondary" },
-        { label: "라운드 재시작", action: "restart-round", tone: "ghost" }
-      ];
+      return [{ label: "라운드 재시작", action: "restart-round", tone: "ghost" }];
     case "ROUND_RESULT":
       return [{ label: isLastRound ? "결과 공개" : "다음 게임", action: "advance", tone: "primary" }];
-    case "PAUSED":
-      return [
-        { label: "재개", action: "resume", tone: "primary" },
-        { label: "라운드 재시작", action: "restart-round", tone: "ghost" }
-      ];
     case "FINAL_RESULT":
       return [
         { label: "대회 종료", action: "advance", tone: "secondary" },
@@ -2562,23 +2438,6 @@ function renderPlayerStage(snapshot) {
           </div>
         </section>
       `;
-    case "PAUSED":
-      return `
-        <section class="panel">
-          <div class="panel-header">
-            <div>
-              <h2>진행이 잠시 멈췄습니다</h2>
-              <p class="muted">${getPhaseLabel(room.pauseInfo?.phase)} 상태에서 관리자가 잠시 정지했습니다.</p>
-            </div>
-            <span class="pill teal">USR-PAUSE</span>
-          </div>
-          ${supportStrip}
-          <div class="timeline-card">
-            <h3>${room.pauseInfo?.restartOnResume ? "재개되면 현재 게임이 처음부터 다시 시작됩니다." : "재개되면 바로 이어서 진행됩니다."}</h3>
-            <p>화면을 유지한 채 잠시만 기다려 주세요.</p>
-          </div>
-        </section>
-      `;
     case "SCORING":
       return `
         <section class="panel">
@@ -2652,14 +2511,8 @@ function renderSpectatorStage(snapshot) {
       </div>
       ${renderStatsRow(snapshot)}
       <div class="timeline-card">
-        <h3>${room.state === "PAUSED" ? "진행 일시정지" : round ? `${round.roundNumber}라운드 · ${escapeHtml(round.title)}` : "대기 중"}</h3>
-        <p>${
-          room.state === "PAUSED"
-            ? `${getPhaseLabel(room.pauseInfo?.phase)} 상태에서 잠시 멈췄습니다.`
-            : round
-              ? escapeHtml(round.description)
-              : "다음 대회 시작을 기다려 주세요."
-        }</p>
+        <h3>${round ? `${round.roundNumber}라운드 · ${escapeHtml(round.title)}` : "대기 중"}</h3>
+        <p>${round ? escapeHtml(round.description) : "다음 대회 시작을 기다려 주세요."}</p>
       </div>
       ${
         round?.results
@@ -2903,8 +2756,13 @@ function mountInteractiveGame(snapshot, preservedNode = null) {
     round,
     mode,
     onSubmit: async (payload) => {
-      await postJson("/api/player/submit", {
+      await postJson("/api/round", {
         clientId: store.clientId,
+        roomCode: room.code,
+        playerId: getViewer(snapshot).playerId,
+        role: getViewer(snapshot).role,
+        nickname: getViewer(snapshot).nickname,
+        action: "submit",
         mode,
         ...payload
       });
@@ -2928,11 +2786,13 @@ function render() {
   }
 
   if (!store.snapshot?.room) {
+    stopPolling();
     app.innerHTML = renderLanding();
     renderCountdowns();
     return;
   }
 
+  startPolling();
   app.innerHTML = renderDashboard(store.snapshot);
   mountInteractiveGame(store.snapshot, preservedNode);
   renderCountdowns();
@@ -3020,21 +2880,24 @@ function getIntentErrorTitle(intent) {
   }
 }
 
-async function syncAfterRoomMutation(roomCode) {
-  await refreshSession();
-  if (!store.stream && store.clientId) {
-    connectStream();
+async function syncAfterRoomMutation(result) {
+  if (result.session) {
+    store.session = result.session;
+    persistSession();
   }
-  await refreshCurrentState().catch(() => {});
-  await refreshRoomDirectory().catch(() => {});
-  await refreshArchiveList().catch(() => {});
-  updateRoomQuery(roomCode || store.session?.roomCode || "");
+  if (result.snapshot?.room) {
+    applySnapshot(result.snapshot);
+  } else {
+    await refreshCurrentState().catch(() => {});
+  }
+  updateRoomQuery(result.roomCode || result.session?.roomCode || "");
 }
 
 async function executeIntent(requestId, intent) {
   switch (intent.type) {
     case "create-room": {
-      const result = await postJson("/api/admin/room", {
+      const result = await postJson("/api/room", {
+        action: "createRoom",
         clientId: store.clientId,
         name: intent.name,
         roundCount: intent.roundCount,
@@ -3043,7 +2906,7 @@ async function executeIntent(requestId, intent) {
       if (!isActionCurrent(requestId)) {
         return;
       }
-      await syncAfterRoomMutation(result.roomCode);
+      await syncAfterRoomMutation(result);
       if (!isActionCurrent(requestId)) {
         return;
       }
@@ -3054,15 +2917,17 @@ async function executeIntent(requestId, intent) {
       if (!intent.roomCode || !intent.nickname) {
         throw new Error("방 코드와 닉네임을 입력해 주세요.");
       }
-      await postJson("/api/join", {
+      const result = await postJson("/api/room", {
+        action: "joinRoom",
         clientId: store.clientId,
         roomCode: intent.roomCode,
-        nickname: intent.nickname
+        nickname: intent.nickname,
+        playerId: store.session?.playerId || null
       });
       if (!isActionCurrent(requestId)) {
         return;
       }
-      await syncAfterRoomMutation(intent.roomCode);
+      await syncAfterRoomMutation(result);
       if (!isActionCurrent(requestId)) {
         return;
       }
@@ -3073,7 +2938,8 @@ async function executeIntent(requestId, intent) {
       if (!intent.roomCode || !intent.recoveryCode) {
         throw new Error("방 코드와 관리자 복구 코드를 입력해 주세요.");
       }
-      await postJson("/api/admin/recover", {
+      const result = await postJson("/api/room", {
+        action: "recoverAdmin",
         clientId: store.clientId,
         roomCode: intent.roomCode,
         recoveryCode: intent.recoveryCode
@@ -3081,7 +2947,7 @@ async function executeIntent(requestId, intent) {
       if (!isActionCurrent(requestId)) {
         return;
       }
-      await syncAfterRoomMutation(intent.roomCode);
+      await syncAfterRoomMutation(result);
       if (!isActionCurrent(requestId)) {
         return;
       }
@@ -3089,7 +2955,8 @@ async function executeIntent(requestId, intent) {
       return;
     }
     case "test-room": {
-      const result = await postJson("/api/admin/room", {
+      const result = await postJson("/api/room", {
+        action: "createRoom",
         clientId: store.clientId,
         name: intent.name,
         roundCount: intent.roundCount,
@@ -3098,7 +2965,7 @@ async function executeIntent(requestId, intent) {
       if (!isActionCurrent(requestId)) {
         return;
       }
-      await syncAfterRoomMutation(result.roomCode);
+      await syncAfterRoomMutation(result);
       if (!isActionCurrent(requestId)) {
         return;
       }
@@ -3158,13 +3025,6 @@ async function runInlineIntent(intent) {
   }
 }
 
-async function handleArchiveSearch(form) {
-  const query = form.querySelector("[name='query']")?.value?.trim() || "";
-  await refreshArchiveList(query);
-  render();
-  setBanner("success", query ? `아카이브 검색 완료: ${query}` : "전체 아카이브 목록을 불러왔습니다.");
-}
-
 function focusField(selector) {
   window.setTimeout(() => {
     document.querySelector(selector)?.focus();
@@ -3172,19 +3032,23 @@ function focusField(selector) {
 }
 
 async function handleAdminAction(action, button) {
-  await postJson("/api/admin/action", {
+  const result = await postJson("/api/round", {
     clientId: store.clientId,
+    roomCode: getRoom(store.snapshot)?.code,
+    role: store.session?.role || null,
+    nickname: store.session?.nickname || null,
     action,
     roundIndex: button?.dataset.roundIndex ? Number(button.dataset.roundIndex) : undefined,
-    playerId: button?.dataset.playerId,
+    playerId: button?.dataset.playerId || store.session?.playerId || null,
     prize:
       action === "update-prize" && button?.dataset.roundIndex
         ? document.querySelector(`#prize-input-${Number(button.dataset.roundIndex) + 1}`)?.value?.trim() || ""
         : undefined
   });
-
+  if (result?.snapshot?.room) {
+    applySnapshot(result.snapshot);
+  }
   if (action === "reset-room") {
-    await refreshArchiveList().catch(() => {});
     setBanner("success", "같은 방으로 새 대회를 다시 열었습니다.");
   }
 }
@@ -3210,8 +3074,6 @@ app.addEventListener("submit", async (event) => {
       } else {
         await runIntent(intent);
       }
-    } else if (form.id === "archive-search-form") {
-      await handleArchiveSearch(form);
     }
   } catch (error) {
     setBanner("error", error instanceof Error ? error.message : "요청 처리 중 오류가 발생했습니다.");
@@ -3324,52 +3186,11 @@ app.addEventListener("click", async (event) => {
       return;
     }
 
-    if (action === "refresh-room-directory") {
-      await refreshRoomDirectory();
-      render();
-      setBanner("success", "진행 중인 방 목록을 새로고침했습니다.");
-      return;
-    }
-
-    if (action === "refresh-archives") {
-      await refreshArchiveList();
-      render();
-      setBanner("success", "종료 대회 기록을 새로고침했습니다.");
-      return;
-    }
-
-    if (action === "clear-recent-rooms") {
-      store.recentRooms = [];
-      saveRecentRooms();
-      render();
-      setBanner("success", "최근 접속 방 기록을 비웠습니다.");
-      return;
-    }
-
-    if (action === "clear-archive-search") {
-      store.archiveQuery = "";
-      await refreshArchiveList("");
-      render();
-      focusField("#archive-search-input");
-      setBanner("success", "아카이브 검색어를 초기화했습니다.");
-      return;
-    }
-
-    if (action === "download-archive-report") {
-      await downloadArchiveReport(button.dataset.archiveId);
-      return;
-    }
-
     if (action === "copy-link" || action === "copy-value") {
       const target = button.dataset.copyTarget ? document.querySelector(`#${button.dataset.copyTarget}`) : null;
       const value = button.dataset.copyValue || target?.value || "";
       await navigator.clipboard.writeText(value);
       setBanner("success", button.dataset.copyMessage || "링크를 복사했습니다.");
-      return;
-    }
-
-    if (action === "export") {
-      await handleExportAction(button.dataset.exportKind);
       return;
     }
 
@@ -3383,12 +3204,7 @@ app.addEventListener("click", async (event) => {
     }
 
     if (action === "save-prize") {
-      await postJson("/api/admin/action", {
-        clientId: store.clientId,
-        action: "update-prize",
-        roundIndex: Number(button.dataset.roundIndex),
-        prize: document.querySelector(`#prize-input-${Number(button.dataset.roundIndex) + 1}`)?.value?.trim() || ""
-      });
+      await handleAdminAction("update-prize", button);
       setBanner("success", "특별상품을 저장했습니다.");
       return;
     }
@@ -3398,11 +3214,7 @@ app.addEventListener("click", async (event) => {
       if (confirmationMessage && !window.confirm(confirmationMessage)) {
         return;
       }
-      await postJson("/api/admin/action", {
-        clientId: store.clientId,
-        action: "remove-player",
-        playerId: button.dataset.playerId
-      });
+      await handleAdminAction("remove-player", button);
       return;
     }
   } catch (error) {
@@ -3413,10 +3225,10 @@ app.addEventListener("click", async (event) => {
 async function attemptAutoRecovery() {
   try {
     await ensureSession({ timeoutMs: 1000 });
-    await refreshRoomDirectory().catch(() => {});
-    await refreshArchiveList().catch(() => {});
     if (store.session?.roomCode) {
       await refreshCurrentState().catch(() => {});
+    } else if (store.displayMode && store.prefilledRoomCode) {
+      setBanner("error", "발표 화면 연결 정보를 찾지 못했습니다. 방 코드를 다시 확인해 주세요.");
     }
   } catch (error) {
     if (error instanceof Error && error.name !== "AbortError" && store.displayMode) {
@@ -3431,15 +3243,16 @@ async function init() {
   const existingClientId = localStorage.getItem(storageKey);
   store.clientId = existingClientId || crypto.randomUUID();
   localStorage.setItem(storageKey, store.clientId);
+  store.session = loadPersistedSession();
+  if (store.session?.roomCode && !store.prefilledRoomCode) {
+    store.prefilledRoomCode = store.session.roomCode;
+  }
   store.presentationMode = localStorage.getItem(presentationStorageKey) === "1";
   store.recentRooms = loadRecentRooms();
   store.createPrizesText = resizePrizeDraft(store.createPrizesText, store.createRoundCount);
 
   render();
   startClockTicker();
-
-  void refreshRoomDirectory().then(render).catch(() => {});
-  void refreshArchiveList().then(render).catch(() => {});
 
   if (store.displayMode || existingClientId) {
     void attemptAutoRecovery();
