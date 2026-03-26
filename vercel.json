@@ -2,7 +2,6 @@
   "cleanUrls": true,
   "functions": {
     "api/*.mjs": {
-      "runtime": "nodejs20.x",
       "maxDuration": 10
     }
   }
