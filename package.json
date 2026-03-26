@@ -1,0 +1,14 @@
+{
+  "name": "realtime-minigame-mvp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server.mjs",
+    "smoke": "node smoke-test.mjs",
+    "smoke:recovery": "node recovery-smoke-test.mjs"
+  }
+}

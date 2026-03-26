@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>회식용 실시간 미니게임 플랫폼 MVP</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="page-shell">
+      <header class="hero-shell">
+        <div class="hero-copy">
+          <span class="eyebrow">Realtime Ops Dashboard</span>
+          <h1>실시간 미니게임 운영 대시보드</h1>
+          <p>
+            관리자 1명이 전체 흐름을 제어하고, 참가자들은 모바일로 동시에 접속해
+            연습판과 본게임을 순서대로 진행하는 실시간 웹앱입니다.
+          </p>
+        </div>
+        <div class="hero-badges">
+          <span>화이트 베이스 UI</span>
+          <span>실시간 동기화</span>
+          <span>모바일 관리자 대응</span>
+          <span>LAN 접속 지원</span>
+        </div>
+      </header>
+
+      <main id="app" class="app-shell"></main>
+    </div>
+
+    <script type="module" src="/app.mjs"></script>
+  </body>
+  </html>
