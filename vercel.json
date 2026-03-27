@@ -1,0 +1,28 @@
+{
+  "rewrites": [
+    {
+      "source": "/api/join",
+      "destination": "/api/game?route=join"
+    },
+    {
+      "source": "/api/state",
+      "destination": "/api/game?route=state"
+    },
+    {
+      "source": "/api/start",
+      "destination": "/api/game?route=start"
+    },
+    {
+      "source": "/api/submit",
+      "destination": "/api/game?route=submit"
+    },
+    {
+      "source": "/api/reset",
+      "destination": "/api/game?route=reset"
+    },
+    {
+      "source": "/healthz",
+      "destination": "/api/game?route=healthz"
+    }
+  ]
+}

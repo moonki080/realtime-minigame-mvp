@@ -75,10 +75,18 @@ async function requestJson(url, options = {}) {
     }
   });
   const payload = await response.json().catch(() => ({}));
-  if (!response.ok) {
+  if (!response.ok || payload.ok === false) {
     throw new Error(payload.error || "요청 처리 중 오류가 발생했습니다.");
   }
   return payload;
+}
+
+function safeJsonParse(raw) {
+  try {
+    return raw ? JSON.parse(raw) : {};
+  } catch {
+    return {};
+  }
 }
 
 function syncedNow() {
@@ -315,14 +323,29 @@ async function fetchState() {
 }
 
 async function joinLobby(nickname) {
+  console.log("[join] click");
   store.busy = true;
   store.error = "";
   render();
   try {
-    const payload = await requestJson("/api/join", {
+    const requestPayload = { nickname };
+    console.log("[join] request payload", requestPayload);
+    const response = await fetch("/api/join", {
       method: "POST",
-      body: JSON.stringify({ nickname })
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(requestPayload)
     });
+    console.log("[join] response status", response.status);
+    const raw = await response.text();
+    const payload = safeJsonParse(raw);
+    console.log("[join] response json", payload);
+
+    if (!response.ok || !payload.ok || !payload.playerId || !payload.state) {
+      throw new Error(payload.error || "입장 처리 중 오류가 발생했습니다. 다시 시도해 주세요.");
+    }
+
     store.session = {
       playerId: payload.playerId,
       nickname: payload.nickname
@@ -334,7 +357,9 @@ async function joinLobby(nickname) {
     startPolling();
     render();
   } catch (error) {
-    enterHome(error instanceof Error ? error.message : "입장에 실패했습니다. 다시 시도해 주세요.");
+    const reason = error instanceof Error ? error.message : "입장 처리 중 오류가 발생했습니다. 다시 시도해 주세요.";
+    console.error("[join] failed reason", reason);
+    enterHome(reason);
   } finally {
     store.busy = false;
     render();
