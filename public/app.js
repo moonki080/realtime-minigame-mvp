@@ -15,6 +15,9 @@ const store = {
   serverOffsetMs: 0,
   error: "",
   info: "",
+  homeNickname: "",
+  shouldFocusNickname: false,
+  shouldSelectNickname: false,
   busy: false,
   fetchInFlight: false,
   pollTimer: null,
@@ -49,6 +52,7 @@ function enterHome(message = "") {
   stopPolling();
   store.info = "";
   store.error = message;
+  store.shouldFocusNickname = true;
   render();
 }
 
@@ -101,6 +105,26 @@ function escapeHtml(value) {
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;");
+}
+
+function shouldAnimateView() {
+  const phase = store.snapshot?.phase;
+  return Boolean(store.snapshot?.me && ["intro", "practice", "main", "result"].includes(phase));
+}
+
+function focusNicknameInput(selection = null) {
+  const input = document.querySelector("#nickname");
+  if (!(input instanceof HTMLInputElement)) {
+    return;
+  }
+  input.focus();
+  if (selection && Number.isInteger(selection.start) && Number.isInteger(selection.end)) {
+    input.setSelectionRange(selection.start, selection.end);
+  } else if (store.shouldSelectNickname) {
+    input.select();
+  }
+  store.shouldFocusNickname = false;
+  store.shouldSelectNickname = false;
 }
 
 function createRng(seedInput) {
@@ -571,7 +595,7 @@ function renderHome(snapshot) {
         <form id="join-form" class="field-stack">
           <div class="field">
             <label for="nickname">닉네임</label>
-            <input id="nickname" name="nickname" maxlength="18" placeholder="예: 김대리" ${joinDisabled ? "disabled" : ""} />
+            <input id="nickname" name="nickname" maxlength="18" placeholder="예: 김대리" value="${escapeHtml(store.homeNickname)}" ${joinDisabled ? "disabled" : ""} />
           </div>
           <div class="button-row">
             <button type="submit" class="primary" ${joinDisabled || store.busy ? "disabled" : ""}>입장하기</button>
@@ -974,9 +998,24 @@ function renderFinal(snapshot) {
 }
 
 function render() {
+  const activeElement = document.activeElement;
+  const nicknameSelection =
+    activeElement instanceof HTMLInputElement && activeElement.id === "nickname"
+      ? {
+          start: activeElement.selectionStart ?? store.homeNickname.length,
+          end: activeElement.selectionEnd ?? store.homeNickname.length
+        }
+      : null;
+  if (activeElement instanceof HTMLInputElement && activeElement.id === "nickname") {
+    store.homeNickname = activeElement.value;
+  }
+
   const snapshot = store.snapshot;
   if (!snapshot.me) {
     app.innerHTML = renderHome(snapshot);
+    if (nicknameSelection || store.shouldFocusNickname) {
+      focusNicknameInput(nicknameSelection);
+    }
     return;
   }
 
@@ -997,6 +1036,9 @@ function render() {
       break;
     default:
       app.innerHTML = renderHome(snapshot);
+      if (nicknameSelection || store.shouldFocusNickname) {
+        focusNicknameInput(nicknameSelection);
+      }
       break;
   }
 }
@@ -1139,11 +1181,19 @@ app.addEventListener("submit", async (event) => {
     event.preventDefault();
     const formData = new FormData(event.target);
     const nickname = String(formData.get("nickname") || "").trim();
+    store.homeNickname = String(formData.get("nickname") || "");
     if (!nickname) {
+      store.shouldFocusNickname = true;
       setError("닉네임을 입력해 주세요.");
       return;
     }
     await joinLobby(nickname);
+  }
+});
+
+app.addEventListener("input", (event) => {
+  if (event.target instanceof HTMLInputElement && event.target.id === "nickname") {
+    store.homeNickname = event.target.value;
   }
 });
 
@@ -1186,6 +1236,9 @@ app.addEventListener("click", async (event) => {
 function startTimers() {
   if (!store.renderTimer) {
     store.renderTimer = window.setInterval(() => {
+      if (!shouldAnimateView()) {
+        return;
+      }
       maybeAutoSubmit();
       render();
     }, 200);
