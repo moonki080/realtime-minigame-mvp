@@ -1,4 +1,3 @@
-const SESSION_KEY = "simple-minigame-player";
 const PHASE_LABELS = {
   lobby: "대기실",
   intro: "게임 안내",
@@ -11,8 +10,8 @@ const PHASE_LABELS = {
 const app = document.querySelector("#app");
 
 const store = {
-  session: loadSession(),
-  snapshot: null,
+  session: null,
+  snapshot: createHomeSnapshot(),
   serverOffsetMs: 0,
   error: "",
   info: "",
@@ -23,27 +22,34 @@ const store = {
   runtime: null
 };
 
-function loadSession() {
-  try {
-    const parsed = JSON.parse(sessionStorage.getItem(SESSION_KEY) || "null");
-    if (!parsed || typeof parsed !== "object" || !parsed.playerId || !parsed.nickname) {
-      return null;
-    }
-    return {
-      playerId: parsed.playerId,
-      nickname: parsed.nickname
-    };
-  } catch {
-    return null;
-  }
+function createHomeSnapshot(overrides = {}) {
+  return {
+    phase: "lobby",
+    joinOpen: true,
+    canStart: false,
+    playerCount: 0,
+    players: [],
+    me: null,
+    round: null,
+    roundResults: [],
+    leaderboard: [],
+    finalRanking: [],
+    history: [],
+    notice: "닉네임만 입력하면 바로 대기실에 입장합니다.",
+    ...overrides
+  };
 }
 
-function saveSession(session) {
-  sessionStorage.setItem(SESSION_KEY, JSON.stringify(session));
-}
-
-function clearSession() {
-  sessionStorage.removeItem(SESSION_KEY);
+function enterHome(message = "") {
+  store.session = null;
+  store.snapshot = createHomeSnapshot();
+  store.serverOffsetMs = 0;
+  store.runtime = null;
+  store.busy = false;
+  stopPolling();
+  store.info = "";
+  store.error = message;
+  render();
 }
 
 function setError(message) {
@@ -260,33 +266,25 @@ function getGaugePosition(runtime) {
 }
 
 async function fetchState() {
-  if (store.fetchInFlight) {
+  if (store.fetchInFlight || !store.session?.playerId) {
     return;
   }
 
   store.fetchInFlight = true;
   try {
-    const query = store.session?.playerId ? `?playerId=${encodeURIComponent(store.session.playerId)}` : "";
-    const snapshot = await requestJson(`/api/state${query}`);
+    const snapshot = await requestJson(`/api/state?playerId=${encodeURIComponent(store.session.playerId)}`);
     store.snapshot = snapshot;
     store.serverOffsetMs = snapshot.serverNow - Date.now();
 
-    if (store.session && !snapshot.me) {
-      clearSession();
-      store.session = null;
-      store.info = "세션이 만료되어 다시 닉네임을 입력해 주세요.";
-    } else if (snapshot.me) {
-      store.session = {
-        playerId: snapshot.me.id,
-        nickname: snapshot.me.nickname
-      };
-      saveSession(store.session);
+    if (!snapshot.me) {
+      enterHome("상태를 불러오지 못했습니다. 다시 시도해 주세요.");
+      return;
     }
 
     ensureRuntime();
     render();
   } catch (error) {
-    setError(error instanceof Error ? error.message : "상태를 불러오지 못했습니다.");
+    setError(error instanceof Error ? error.message : "상태 동기화에 실패했습니다. 잠시 후 다시 시도해 주세요.");
   } finally {
     store.fetchInFlight = false;
   }
@@ -305,14 +303,14 @@ async function joinLobby(nickname) {
       playerId: payload.playerId,
       nickname: payload.nickname
     };
-    saveSession(store.session);
     store.snapshot = payload.state;
     store.serverOffsetMs = payload.state.serverNow - Date.now();
     store.info = `${payload.nickname}님으로 입장했습니다.`;
     ensureRuntime();
+    startPolling();
     render();
   } catch (error) {
-    setError(error instanceof Error ? error.message : "입장에 실패했습니다.");
+    enterHome(error instanceof Error ? error.message : "입장에 실패했습니다. 다시 시도해 주세요.");
   } finally {
     store.busy = false;
     render();
@@ -336,7 +334,7 @@ async function startGame() {
     ensureRuntime();
     render();
   } catch (error) {
-    setError(error instanceof Error ? error.message : "게임 시작에 실패했습니다.");
+    enterHome(error instanceof Error ? error.message : "상태를 불러오지 못했습니다. 다시 시도해 주세요.");
   } finally {
     store.busy = false;
     render();
@@ -360,7 +358,7 @@ async function resetGame() {
     ensureRuntime();
     render();
   } catch (error) {
-    setError(error instanceof Error ? error.message : "초기화에 실패했습니다.");
+    enterHome(error instanceof Error ? error.message : "상태를 불러오지 못했습니다. 다시 시도해 주세요.");
   } finally {
     store.busy = false;
     render();
@@ -976,19 +974,6 @@ function renderFinal(snapshot) {
 }
 
 function render() {
-  if (!store.snapshot) {
-    app.innerHTML = `
-      <div class="screen">
-        <section class="hero-card">
-          <span class="eyebrow">Loading</span>
-          <h1>실시간 미니게임 준비 중</h1>
-          <p>상태를 불러오는 중입니다.</p>
-        </section>
-      </div>
-    `;
-    return;
-  }
-
   const snapshot = store.snapshot;
   if (!snapshot.me) {
     app.innerHTML = renderHome(snapshot);
@@ -1199,15 +1184,33 @@ app.addEventListener("click", async (event) => {
 });
 
 function startTimers() {
-  store.pollTimer = window.setInterval(fetchState, 1000);
-  store.renderTimer = window.setInterval(() => {
-    maybeAutoSubmit();
-    render();
-  }, 200);
+  if (!store.renderTimer) {
+    store.renderTimer = window.setInterval(() => {
+      maybeAutoSubmit();
+      render();
+    }, 200);
+  }
 }
 
-async function boot() {
-  await fetchState();
+function startPolling() {
+  if (store.pollTimer) {
+    return;
+  }
+  store.pollTimer = window.setInterval(() => {
+    fetchState();
+  }, 1000);
+}
+
+function stopPolling() {
+  if (!store.pollTimer) {
+    return;
+  }
+  window.clearInterval(store.pollTimer);
+  store.pollTimer = null;
+}
+
+function boot() {
+  render();
   startTimers();
 }
 
