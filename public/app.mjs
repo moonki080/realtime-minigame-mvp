@@ -1,4 +1,4 @@
-import { GAME_DEFINITIONS } from "/shared/gameData.mjs";
+import { GAME_DEFINITIONS } from "./shared/gameData.mjs";
 import { mountGameController } from "./games.mjs";
 
 const app = document.querySelector("#app");

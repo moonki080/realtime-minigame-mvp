@@ -26,6 +26,15 @@ async function fetchJson(url, options = {}) {
   return data;
 }
 
+async function fetchText(url, options = {}) {
+  const response = await fetch(url, options);
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}: ${text}`);
+  }
+  return text;
+}
+
 async function post(pathname, payload) {
   return fetchJson(`${baseUrl}${pathname}`, {
     method: "POST",
@@ -233,6 +242,9 @@ async function main() {
     const ready = await getHealth("/readyz");
     assert(health.ok === true, "healthz 응답이 비정상입니다.");
     assert(ready.ok === true, "readyz 응답이 비정상입니다.");
+
+    const staticGameData = await fetchText(`${baseUrl}/shared/gameData.mjs`);
+    assert(staticGameData.includes("GAME_DEFINITIONS"), "정적 gameData 모듈이 정상 서빙되지 않습니다.");
 
     const freshHome = await bootstrap("fresh-home-client");
     assert(freshHome.recovered === false, "신규 홈 클라이언트는 복구되면 안 됩니다.");

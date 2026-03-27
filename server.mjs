@@ -10,7 +10,6 @@ import leaderboardHandler from "./api/leaderboard.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.join(__dirname, "public");
-const sharedDir = path.join(__dirname, "shared");
 const port = Number(process.env.PORT || 4310);
 const host = process.env.HOST || "0.0.0.0";
 let shuttingDown = false;
@@ -94,11 +93,6 @@ const server = createServer(async (request, response) => {
 
     if (request.url?.startsWith("/api/leaderboard")) {
       await leaderboardHandler(request, response);
-      return;
-    }
-
-    if (request.method === "GET" && request.url?.startsWith("/shared/")) {
-      await serveFile(response, sharedDir, request.url.replace("/shared", ""));
       return;
     }
 

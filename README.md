@@ -42,13 +42,13 @@ realtime-minigame-mvp/
     games.mjs
     styles.css
     index.html
-  shared/
-    gameData.mjs
+    shared/
+      gameData.mjs
   server.mjs
   vercel.json
 ```
 
-`server.mjs` 는 배포 서버가 아니라 로컬 확인용 adapter 입니다. 실제 배포 기준 런타임은 `/api/*.mjs` 입니다.
+`server.mjs` 는 배포 서버가 아니라 로컬 확인용 adapter 입니다. 실제 배포 기준 런타임은 `/api/*.mjs` 이고, 브라우저에서 직접 import 되는 모듈은 모두 `public/` 아래에서 정적으로 서빙합니다.
 
 ## 로컬 실행 방법
 
