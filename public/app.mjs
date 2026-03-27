@@ -1456,6 +1456,10 @@ function renderStatsRow(snapshot) {
   const room = getRoom(snapshot);
   const viewer = getViewer(snapshot);
   const round = getRound(snapshot);
+  const roster = getRosterGroups(snapshot);
+  const totalOnline = (snapshot?.players || []).filter((player) => player.connected).length;
+  const totalOffline = (snapshot?.players || []).filter((player) => !player.connected).length;
+  const participantCount = room.lockedPlayerCount || roster.participants.length;
   const roleLabel =
     viewer.role === "admin"
       ? "관리자"
@@ -1483,6 +1487,22 @@ function renderStatsRow(snapshot) {
       <div class="stat-card">
         <span class="stat-label">현재 라운드</span>
         <div class="stat-value">${round ? `${round.roundNumber}/${room.roundCount}` : "-"}</div>
+      </div>
+      <div class="stat-card">
+        <span class="stat-label">참가 인원</span>
+        <div class="stat-value">${participantCount}명</div>
+      </div>
+      <div class="stat-card">
+        <span class="stat-label">온라인 인원</span>
+        <div class="stat-value">${totalOnline}명</div>
+      </div>
+      <div class="stat-card">
+        <span class="stat-label">관전 인원</span>
+        <div class="stat-value">${roster.spectators.length}명</div>
+      </div>
+      <div class="stat-card">
+        <span class="stat-label">오프라인 인원</span>
+        <div class="stat-value">${totalOffline}명</div>
       </div>
     </div>
   `;
@@ -2068,6 +2088,11 @@ function renderWaitingStage(snapshot) {
       </div>
       ${renderStatsRow(snapshot)}
       <div class="subtle-divider"></div>
+      <div class="admin-actions">
+        <button type="button" class="secondary" data-action="admin" data-admin-action="reroll-games">게임 재추첨</button>
+        <button type="button" class="primary" data-action="admin" data-admin-action="start-tournament">대회 시작</button>
+      </div>
+      <div class="subtle-divider"></div>
       ${renderInviteCard(snapshot)}
       <div class="subtle-divider"></div>
       <div class="split-grid">
@@ -2079,11 +2104,6 @@ function renderWaitingStage(snapshot) {
           <h3 class="section-title">특별상품 초안</h3>
           ${renderPrizeEditor(snapshot)}
         </div>
-      </div>
-      <div class="subtle-divider"></div>
-      <div class="admin-actions">
-        <button type="button" class="secondary" data-action="admin" data-admin-action="reroll-games">게임 재추첨</button>
-        <button type="button" class="primary" data-action="admin" data-admin-action="start-tournament">대회 시작</button>
       </div>
     </section>
   `;
@@ -2918,8 +2938,8 @@ function renderDashboard(snapshot) {
       <div class="app-shell">
         ${viewer.role === "admin" ? renderAdminToolbar(snapshot) : ""}
         ${presentationBoard}
-        ${adminOperationsPanel}
         ${mainStage}
+        ${adminOperationsPanel}
       </div>
       ${renderSidebar(snapshot)}
     </div>
