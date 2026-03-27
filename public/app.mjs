@@ -208,11 +208,58 @@ function getSessionSignature(session = store.session) {
   ].join("|");
 }
 
-function syncAppViewWithSession() {
-  store.appView = store.session?.roomCode ? "room" : "home";
+function getCurrentRole(snapshot = store.snapshot, session = store.session) {
+  return getViewer(snapshot).role || session?.role || null;
 }
 
-function commitSession(nextSession, { source = "unknown" } = {}) {
+function getCurrentRoomCode(snapshot = store.snapshot, session = store.session) {
+  return getRoom(snapshot)?.code || session?.roomCode || null;
+}
+
+function deriveAppView(snapshot = store.snapshot, session = store.session) {
+  const role = getCurrentRole(snapshot, session);
+  const roomCode = getCurrentRoomCode(snapshot, session);
+  const roomState = getRoom(snapshot)?.state || null;
+
+  if (!roomCode || !role) {
+    return "home";
+  }
+
+  if (role === "admin") {
+    if (roomState === "WAITING" || !roomState) {
+      return "admin_waiting_room";
+    }
+    return "admin_room";
+  }
+
+  if (role === "display") {
+    return "display_room";
+  }
+
+  if (role === "player") {
+    return "player_room";
+  }
+
+  if (role === "spectator") {
+    return "spectator_room";
+  }
+
+  if (role === "guest") {
+    return "guest_room";
+  }
+
+  return "room_restore";
+}
+
+function syncAppView() {
+  store.appView = deriveAppView();
+}
+
+function hasProtectedAdminRoom() {
+  return store.appView === "admin_waiting_room" || (store.session?.role === "admin" && Boolean(store.session?.roomCode));
+}
+
+function commitSession(nextSession, { source = "unknown", persist = true } = {}) {
   const previousSignature = getSessionSignature(store.session);
   const normalizedSession = nextSession
     ? {
@@ -226,32 +273,40 @@ function commitSession(nextSession, { source = "unknown" } = {}) {
   const nextSignature = getSessionSignature(normalizedSession);
 
   store.session = normalizedSession;
-  syncAppViewWithSession();
+  syncAppView();
 
-  if (store.session?.roomCode) {
+  if (persist && store.session?.roomCode) {
     store.prefilledRoomCode = store.session.roomCode;
     persistSession();
-  } else {
+    if (store.session?.role === "admin") {
+      console.info("[storage] persisted admin session", {
+        roomCode: store.session.roomCode,
+        source
+      });
+    }
+  } else if (persist) {
     clearPersistedSession();
   }
 
   if (previousSignature !== nextSignature) {
     store.sessionRevision += 1;
-    if (store.session?.role === "admin" && store.session.roomCode) {
-      console.info("persist admin session", {
-        roomCode: store.session.roomCode,
-        source
-      });
-    }
   }
 }
 
 function clearSessionToHome(reason) {
-  if (store.session?.roomCode || store.snapshot?.room) {
+  if (hasProtectedAdminRoom()) {
+    console.info("[restore] skipped because live admin room exists", {
+      reason,
+      roomCode: store.session?.roomCode
+    });
+    return;
+  }
+  if (store.session?.roomCode || store.snapshot?.room || store.prefilledRoomCode) {
     return;
   }
   store.entryView = store.displayMode ? "display" : "home";
-  console.info("fallback to home", { reason });
+  store.appView = "home";
+  console.info(`[fallback-home] reason=${reason}`);
 }
 
 function clearActionTimer() {
@@ -449,9 +504,17 @@ async function refreshSession(options = {}) {
 
   if (data.snapshot?.room) {
     applySnapshot(data.snapshot, {
-      source: options.source || "bootstrap"
+      source: options.source || "bootstrap",
+      logRestoreSuccess: options.source === "auto-recovery"
     });
   } else if (!data.recovered) {
+    if (hasProtectedAdminRoom()) {
+      console.info("[restore] skipped because live admin room exists", {
+        source: options.source || "bootstrap",
+        roomCode: store.session?.roomCode
+      });
+      return data;
+    }
     if (options.suppressHomeFallback) {
       return data;
     }
@@ -515,14 +578,16 @@ function applySnapshot(snapshot, options = {}) {
       nickname: viewer.nickname
     },
     {
-      source: options.source || "snapshot"
+      source: options.source || "snapshot",
+      persist: options.persist !== false
     }
   );
-  if (viewer.roomCode) {
+  syncAppView();
+  if (options.updateUrl !== false && viewer.roomCode) {
     updateRoomQuery(viewer.roomCode);
   }
-  if (options.source === "auto-recovery" && viewer.role === "admin") {
-    console.info("restore existing admin room", {
+  if (options.logRestoreSuccess && viewer.role === "admin") {
+    console.info("[restore] success", {
       roomCode: viewer.roomCode,
       state: snapshot.room?.state
     });
@@ -559,6 +624,14 @@ async function refreshCurrentState() {
   if (state.room) {
     applySnapshot(state, {
       source: "poll"
+    });
+    return state;
+  }
+
+  if (hasProtectedAdminRoom()) {
+    console.info("[restore] skipped because live admin room exists", {
+      source: "poll-empty",
+      roomCode: store.session?.roomCode
     });
     return state;
   }
@@ -2899,6 +2972,10 @@ function mountInteractiveGame(snapshot, preservedNode = null) {
 function render() {
   let preservedNode = null;
   const nextInteractiveKey = getInteractiveKey(store.snapshot);
+  const currentRole = getCurrentRole();
+  const currentRoomCode = getCurrentRoomCode();
+
+  console.info(`[render] currentView=${store.appView}, role=${currentRole || "none"}, roomCode=${currentRoomCode || "none"}`);
 
   if (store.activeController && nextInteractiveKey === store.activeInteractiveKey && store.activeGameNode) {
     preservedNode = store.activeGameNode;
@@ -2909,7 +2986,7 @@ function render() {
 
   if (!store.snapshot?.room) {
     stopPolling();
-    app.innerHTML = store.appView === "room" && store.session?.roomCode ? renderRoomRestoreShell() : renderLanding();
+    app.innerHTML = store.appView !== "home" && getCurrentRoomCode() ? renderRoomRestoreShell() : renderLanding();
     renderCountdowns();
     return;
   }
@@ -3002,32 +3079,77 @@ function getIntentErrorTitle(intent) {
   }
 }
 
-async function syncAfterRoomMutation(result) {
+function persistCommittedSession(source) {
+  if (!store.session?.roomCode) {
+    clearPersistedSession();
+    return;
+  }
+  persistSession();
+  if (store.session.role === "admin") {
+    console.info("[storage] persisted admin session", {
+      roomCode: store.session.roomCode,
+      source
+    });
+  }
+}
+
+function applyRoomResultInMemory(result, source) {
   if (result.session) {
     commitSession(result.session, {
-      source: "room-mutation"
+      source,
+      persist: false
     });
   }
   if (result.snapshot?.room) {
     applySnapshot(result.snapshot, {
-      source: "room-mutation"
+      source,
+      persist: false,
+      updateUrl: false
     });
-    const viewer = getViewer(result.snapshot);
-    if (viewer.role === "admin" && result.snapshot.room.state === "WAITING") {
-      console.info("enter waiting room", {
-        roomCode: result.snapshot.room.code
-      });
-    }
-  } else {
-    await refreshCurrentState().catch(() => {});
   }
+  syncAppView();
+}
+
+async function syncAfterRoomMutation(result, options = {}) {
+  const source = options.source || "room-mutation";
+
+  applyRoomResultInMemory(result, source);
+
+  if (source === "create-room") {
+    console.info("[state] after createRoom", {
+      currentView: store.appView,
+      role: store.session?.role,
+      roomCode: store.session?.roomCode,
+      roundCount: result.snapshot?.room?.roundCount,
+      recoveryCode: result.adminRecoveryCode || result.snapshot?.viewer?.adminRecoveryCode || null
+    });
+  }
+
+  persistCommittedSession(source);
   updateRoomQuery(result.roomCode || result.session?.roomCode || "");
+
+  if (result.session) {
+    store.prefilledRoomCode = result.session.roomCode || store.prefilledRoomCode;
+  }
+
+  if (!result.snapshot?.room) {
+    await refreshCurrentState().catch(() => {});
+    return;
+  }
+
+  const viewer = getViewer(result.snapshot);
+  if (viewer.role === "admin" && result.snapshot.room.state === "WAITING") {
+    store.appView = "admin_waiting_room";
+    console.info("enter waiting room", {
+      roomCode: result.snapshot.room.code
+    });
+  }
 }
 
 async function executeIntent(requestId, intent) {
   switch (intent.type) {
     case "create-room": {
-      console.info("createRoom start", {
+      console.info("[createRoom] start", {
         name: intent.name,
         roundCount: intent.roundCount
       });
@@ -3041,13 +3163,15 @@ async function executeIntent(requestId, intent) {
       if (!isActionCurrent(requestId)) {
         return;
       }
-      console.info("createRoom success", {
+      console.info("[createRoom] success", {
         roomCode: result.roomCode,
         role: result.session?.role,
         roundCount: result.snapshot?.room?.roundCount,
         recoveryCode: result.adminRecoveryCode
       });
-      await syncAfterRoomMutation(result);
+      await syncAfterRoomMutation(result, {
+        source: "create-room"
+      });
       if (!isActionCurrent(requestId)) {
         return;
       }
@@ -3068,7 +3192,9 @@ async function executeIntent(requestId, intent) {
       if (!isActionCurrent(requestId)) {
         return;
       }
-      await syncAfterRoomMutation(result);
+      await syncAfterRoomMutation(result, {
+        source: "join-room"
+      });
       if (!isActionCurrent(requestId)) {
         return;
       }
@@ -3088,7 +3214,9 @@ async function executeIntent(requestId, intent) {
       if (!isActionCurrent(requestId)) {
         return;
       }
-      await syncAfterRoomMutation(result);
+      await syncAfterRoomMutation(result, {
+        source: "recover-admin"
+      });
       if (!isActionCurrent(requestId)) {
         return;
       }
@@ -3106,7 +3234,9 @@ async function executeIntent(requestId, intent) {
       if (!isActionCurrent(requestId)) {
         return;
       }
-      await syncAfterRoomMutation(result);
+      await syncAfterRoomMutation(result, {
+        source: "create-room"
+      });
       if (!isActionCurrent(requestId)) {
         return;
       }
@@ -3370,6 +3500,10 @@ app.addEventListener("click", async (event) => {
 });
 
 async function attemptAutoRecovery() {
+  console.info("[restore] begin", {
+    role: store.session?.role || null,
+    roomCode: store.session?.roomCode || store.prefilledRoomCode || null
+  });
   try {
     await ensureSession({
       timeoutMs: 1000,
@@ -3378,6 +3512,12 @@ async function attemptAutoRecovery() {
     });
     if (store.session?.roomCode) {
       await refreshCurrentState().catch(() => {});
+      if (hasProtectedAdminRoom()) {
+        console.info("[restore] success", {
+          roomCode: store.session.roomCode,
+          role: store.session.role
+        });
+      }
     } else if (store.displayMode && store.prefilledRoomCode) {
       setBanner("error", "발표 화면 연결 정보를 찾지 못했습니다. 방 코드를 다시 확인해 주세요.");
     }
@@ -3397,7 +3537,8 @@ async function init() {
   const persistedSession = loadPersistedSession();
   if (persistedSession) {
     commitSession(persistedSession, {
-      source: "init"
+      source: "init",
+      persist: false
     });
     if (store.session?.role === "admin" && store.session.roomCode) {
       console.info("restore existing admin room", {

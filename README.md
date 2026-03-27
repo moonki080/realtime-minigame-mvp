@@ -9,7 +9,9 @@ Vercel 배포를 기준으로 다시 정리한 회식용 실시간 미니게임 
 - 파일 저장을 제거하고 `ROOM_STORE_URL`, `ROOM_STORE_TOKEN`, `ROOM_STORE_PREFIX` 기반 외부 저장소를 사용하도록 바꿨습니다.
 - 첫 진입 화면은 무한 스피너 대신 `관리자 시작 / 참가자 입장 / 테스트 모드` 홈으로 고정했습니다.
 - 관리자/참가자/발표 화면은 SSE 대신 polling으로 상태를 동기화합니다.
-- 화면 전환 기준은 persisted session(`roomCode`, `role`) + 앱 내부 `appView` 이며, 이 정보가 없을 때만 홈으로 fallback 합니다.
+- 관리자 대기실 복원 기준: persisted session 에 `roomCode` 와 `role=admin` 이 있으면 `admin_waiting_room` 우선 복원
+- 홈 fallback 기준: `roomCode`, `role`, storage, URL 후보가 모두 없을 때만 홈으로 이동
+- 상태 전환 우선순위: 메모리 state -> storage 저장 -> URL 반영 -> render
 - 화이트 베이스 운영 대시보드 톤과 모바일 관리자 하단 액션 바를 유지한 채 새 API 구조에 맞췄습니다.
 
 ## 현재 동작 범위
